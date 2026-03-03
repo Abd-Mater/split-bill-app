@@ -9,6 +9,9 @@ import {
   sampleSettlements,
 } from '@/data/sampleData';
 import { useLocalStorage, STORAGE_KEYS } from '@/hooks/useLocalStorage';
+import { addGroup as addGroupToFirebase } from '../firebase/billsService';
+import { auth } from '../firebase/config'; // لنحصل على UID الحقيقي
+import { addGroup as addGroupToFirebase, addBill as addBillToFirebase } from '../firebase/billsService';
 
 interface AppState {
   currentUser: User;
@@ -112,104 +115,141 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // ── إنشاء مجموعة جديدة (تُحفظ فوراً) ───────────────────────
-  const createGroup = useCallback((name: string, emoji: string, memberIds: string[]) => {
-    const newGroup: Group = {
-      id: uuidv4(),
-      name,
-      emoji,
-      createdBy: currentUser.id,
-      members: [
-        { userId: currentUser.id, role: 'admin', joinedAt: new Date().toISOString() },
-        ...memberIds.map((id) => ({
-          userId: id,
-          role: 'member' as const,
-          joinedAt: new Date().toISOString(),
-        })),
-      ],
-      createdAt: new Date().toISOString(),
-    };
-    setGroups((prev) => [newGroup, ...prev]);
-    setSelectedGroupId(newGroup.id);
-    setCurrentScreen('group-detail');
-  }, [currentUser.id, setGroups]);
+const createGroup = useCallback(async (name: string, emoji: string, memberIds: string[]) => {
+  // 1. الحصول على الـ UID الحقيقي من الفايربيز (وليس من LocalStorage)
+  const currentUserId = auth.currentUser?.uid;
+  
+  if (!currentUserId) {
+    alert("عفواً، يجب تسجيل الدخول أولاً!");
+    return;
+  }
+
+  const newGroup: Group = {
+    id: uuidv4(), // سنستبدله لاحقاً بـ Key الفايربيز
+    name,
+    emoji,
+    createdBy: currentUserId,
+    members: [
+      { userId: currentUserId, role: 'admin', joinedAt: new Date().toISOString() },
+      ...memberIds.map((id) => ({
+        userId: id,
+        role: 'member' as const,
+        joinedAt: new Date().toISOString(),
+      })),
+    ],
+    createdAt: new Date().toISOString(),
+  };
+
+  try {
+    // 🔥 الخطوة السحرية: إرسال للفايربيز
+    const firebaseId = await addGroupToFirebase(currentUserId, newGroup);
+    
+    if (firebaseId) {
+      // نحدث الحالة المحلية باستخدام المعرف الذي جاء من الفايربيز
+      const groupWithId = { ...newGroup, id: firebaseId };
+      setGroups((prev) => [groupWithId, ...prev]);
+      setSelectedGroupId(firebaseId);
+      setCurrentScreen('group-detail');
+    }
+  } catch (error) {
+    console.error("❌ فشل الحفظ في فايربيز:", error);
+  }
+}, [setGroups, setCurrentScreen]);
 
   // ── إضافة فاتورة بتقسيم مخصص (تُحفظ فوراً) ─────────────────
-  const addBillCustom = useCallback(
-    (
-      groupId: string,
-      title: string,
-      amount: number,
-      category: BillCategory,
-      splitType: 'equal' | 'custom',
-      paidBy: string,
-      customSplits: Record<string, number>,
-      description?: string
-    ) => {
-      const group = groups.find((g) => g.id === groupId);
-      if (!group) return;
+const addBillCustom = useCallback(
+  async (
+    groupId: string,
+    title: string,
+    amount: number,
+    category: BillCategory,
+    splitType: 'equal' | 'custom',
+    paidBy: string,
+    customSplits: Record<string, number>,
+    description?: string
+  ) => {
+    const currentUserId = auth.currentUser?.uid;
+    if (!currentUserId) return;
 
-      const newBill: Bill = {
-        id: uuidv4(),
-        groupId,
-        title,
-        description,
-        totalAmount: amount,
-        currency: 'SAR',
-        paidBy,
-        splitType,
-        splits: group.members.map((m) => ({
-          userId: m.userId,
-          amount: customSplits[m.userId] ?? Math.round((amount / group.members.length) * 100) / 100,
-          paid: m.userId === paidBy,
-          paidAt: m.userId === paidBy ? new Date().toISOString() : undefined,
-        })),
-        createdAt: new Date().toISOString(),
-        category,
-      };
-      setBills((prev) => [newBill, ...prev]);
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) return;
+
+    const newBill: Omit<Bill, 'id'> = {
+      groupId,
+      title,
+      description,
+      totalAmount: amount,
+      currency: 'SAR',
+      paidBy,
+      splitType,
+      splits: group.members.map((m) => ({
+        userId: m.userId,
+        // هنا نستخدم القيمة المخصصة من الـ Record، ولو مش موجودة نحط 0
+        amount: customSplits[m.userId] ?? 0,
+        paid: m.userId === paidBy,
+        paidAt: m.userId === paidBy ? new Date().toISOString() : undefined,
+      })),
+      createdAt: new Date().toISOString(),
+      category,
+    };
+
+    // 🔥 الرفع للفايربيز
+    const billId = await addBillToFirebase(currentUserId, newBill);
+    
+    if (billId) {
+      setBills((prev) => [{ ...newBill, id: billId }, ...prev]);
       setCurrentScreen('group-detail');
-    },
-    [groups, setBills]
-  );
+    }
+  },
+  [groups, setBills, setCurrentScreen]
+);
 
   // ── إضافة فاتورة (تُحفظ فوراً) ──────────────────────────────
-  const addBill = useCallback(
-    (
-      groupId: string,
-      title: string,
-      amount: number,
-      category: BillCategory,
-      splitType: 'equal' | 'custom',
-      paidBy: string,
-      description?: string
-    ) => {
-      const group = groups.find((g) => g.id === groupId);
-      if (!group) return;
+const addBill = useCallback(
+  async (
+    groupId: string,
+    title: string,
+    amount: number,
+    category: BillCategory,
+    splitType: 'equal' | 'custom',
+    paidBy: string,
+    description?: string
+  ) => {
+    const currentUserId = auth.currentUser?.uid;
+    if (!currentUserId) return;
 
-      const splitAmount = amount / group.members.length;
-      const newBill: Bill = {
-        id: uuidv4(),
-        groupId,
-        title,
-        description,
-        totalAmount: amount,
-        currency: 'SAR',
-        paidBy,
-        splitType,
-        splits: group.members.map((m) => ({
-          userId: m.userId,
-          amount: Math.round(splitAmount * 100) / 100,
-          paid: m.userId === paidBy,
-          paidAt: m.userId === paidBy ? new Date().toISOString() : undefined,
-        })),
-        createdAt: new Date().toISOString(),
-        category,
-      };
-      setBills((prev) => [newBill, ...prev]);
+    const group = groups.find((g) => g.id === groupId);
+    if (!group) return;
+
+    const splitAmount = amount / group.members.length;
+    const newBill: Omit<Bill, 'id'> = {
+      groupId,
+      title,
+      description,
+      totalAmount: amount,
+      currency: 'SAR',
+      paidBy,
+      splitType,
+      splits: group.members.map((m) => ({
+        userId: m.userId,
+        amount: Math.round(splitAmount * 100) / 100,
+        paid: m.userId === paidBy,
+        paidAt: m.userId === paidBy ? new Date().toISOString() : undefined,
+      })),
+      createdAt: new Date().toISOString(),
+      category,
+    };
+
+    // 🔥 الحفظ في فايربيز
+    const billId = await addBillToFirebase(currentUserId, newBill);
+    
+    if (billId) {
+      setBills((prev) => [{ ...newBill, id: billId }, ...prev]);
       setCurrentScreen('group-detail');
-    },
-    [groups, setBills]
-  );
+    }
+  },
+  [groups, setBills, setCurrentScreen]
+);
 
   // ── تحديث فاتورة (تُحفظ فوراً) ──────────────────────────────
   const updateBill = useCallback((billId: string, updates: Partial<Bill>) => {
